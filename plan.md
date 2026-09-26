@@ -373,6 +373,56 @@ via `Volume.PV()`.
 - e2e (later): delete and recreate a PVC and check the data is still there. Confirm
   that `.` in disk names works on LVM, ZFS, RBD and dir storages.
 
+## Test environment
+
+A dedicated Proxmox VE test host is set up (2026-09-26). Go and Docker are **not**
+installed locally, so all building and testing happens there.
+
+- **Access:** `ssh -F ~/.ssh/claude-pve.config <pve|builder|k8s-a|k8s-b>` (key
+  `~/.ssh/claude-pve`; guests are reached through `pve`). Host `10.20.30.10`, Proxmox
+  node name `dev`, standalone PVE 9.2, 2 vCPU, 15 GiB RAM.
+- **Guests** on an internal NAT network `10.99.0.0/24`:
+  - `builder` (LXC 200, `10.99.0.20`): Go 1.27.1, golangci-lint v2.13.2 (the CI
+    version), Docker with buildx, helm, kubectl, image registry `10.99.0.20:5000`.
+  - `k8s-a` (VM 101, `10.99.0.11`) and `k8s-b` (VM 102, `10.99.0.12`): single-node k3s
+    v1.36.4, node labels `region=dev`, `zone=dev`, driver installed as Helm release
+    `proxmox-csi` in `csi-proxmox`, VolumeSnapshot CRDs and controller v8.6.0. Both
+    have a Proxmox snapshot `clean` for rollback. **k8s-b is kept stopped**; start it
+    (`qm start 102`) for the multi-cluster `${k8sClusterName}` tests.
+- **Storages and StorageClasses** (all smoke-tested: create, attach, write, delete):
+
+  | StorageClass | Proxmox storage | Type |
+  |---|---|---|
+  | `proxmox-lvm` (default) | `local-lvm` | LVM-thin (block) |
+  | `proxmox-zfs` | `local-zfs` (pool `tank/data`) | ZFS (block) |
+  | `proxmox-dir` | `local`, `storageFormat: qcow2` | directory (file-based) |
+
+  No Ceph/RBD, so RBD naming can't be tested here.
+- **Proxmox API:** user `kubernetes-csi@pve`, token `csi`, role `CSI` with the extended
+  (replication) privileges from `docs/install.md`.
+- **Dev loop:**
+  1. `rsync -az --delete -e "ssh -F $HOME/.ssh/claude-pve.config" ./ builder:/src/`
+     (include `.git`; the Makefile needs it for the image tag).
+  2. On builder: `source /etc/profile.d/go.sh; cd /src && make unit` / `make lint`.
+  3. On builder: `/root/dev/deploy.sh [k8s-a|k8s-b]` builds the images, pushes them
+     with a unique tag, runs `helm upgrade` with `/root/dev/values-<cluster>.yaml` and
+     waits for the rollout. Clusters that aren't running are skipped.
+  - Kubeconfigs: `/root/dev/kube/<cluster>` on builder. Values files contain the
+    token secret; don't copy them into the repo.
+- **Disk space is tight** (60 GB host disk + 10 GB ZFS disk). Keep test PVCs at
+  1–2 Gi and delete them afterwards. The builder caps its Docker build cache at 3 GB.
+- **Baseline (commit 82ce560):** `make lint` 0 issues, `make unit` passes.
+- **Before implementing:**
+  1. Check the assumptions listed under "Not found in Context7" against the live
+     clusters (`--extra-create-metadata` keys, `volume.kubernetes.io/selected-node`).
+     The chart doesn't pass `--extra-create-metadata` today.
+  2. Run a baseline e2e pass. The e2e framework defaults to some StorageClass names
+     that don't exist here (`proxmox`, `proxmox-secret`, `proxmox-ceph`, `proxmox-rbd`;
+     `proxmox-zfs` for replication does match); set
+     `E2E_STORAGECLASS=proxmox-lvm`, `E2E_STORAGECLASSES=proxmox-lvm,proxmox-zfs,proxmox-dir`
+     and friends (see `test/e2e/framework/config.go`). Shared-storage (Ceph) tests don't
+     apply.
+
 ## Docs
 
 The naming rules are not intuitive, so they need a dedicated, well-explained docs
