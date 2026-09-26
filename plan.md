@@ -473,9 +473,10 @@ installed locally, so all building and testing happens there.
 
      Both failures come from the environment, not the driver. To compare after
      implementing: `lifecycle` can't pass on single-node clusters (or run only its
-     single-replica steps); `snapshot` needs a root@pam token (not set up, a security
-     decision). The snapshot-related parts of the plan (`CopyVolume` fix #5) are
-     therefore covered by unit tests only. The e2e framework defaults to some StorageClass names
+     single-replica steps); `snapshot` needs a root@pam token. **Decided: skip the
+     snapshot e2e tests for now** (snapshots are experimental; no root@pam token is set
+     up). The snapshot-related parts of the plan (`CopyVolume` fix #5) are covered by
+     unit tests only. The e2e framework defaults to some StorageClass names
      that don't exist here (`proxmox`, `proxmox-secret`, `proxmox-ceph`, `proxmox-rbd`;
      `proxmox-zfs` for replication does match); set
      `E2E_STORAGECLASS=proxmox-lvm`, `E2E_STORAGECLASSES=proxmox-lvm,proxmox-zfs,proxmox-dir`
