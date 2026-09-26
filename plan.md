@@ -1,6 +1,7 @@
 # Plan: templated disk names (`diskName`)
 
-Status: **planning done, ready to implement** — all open questions decided.
+Status: **planning done, ready to implement** — all open questions decided (incl. #6
+from the Context7 check).
 
 ## Goal
 
@@ -87,6 +88,9 @@ Notes:
   - Too long is an error, never cut short (cutting could also create identical names).
   - Edge cases (device-mapper `-` doubling) are left to Proxmox/LVM, which return
     clear errors.
+- **Volume ID limit:** in addition, the full volume ID (`region/zone/storage/disk`, the
+  longer of the two ID forms) may be at most **128 bytes**, the CSI spec limit. Too long
+  gives `InvalidArgument` with an error naming both lengths (disk name and volume ID).
 - **All of these rules always apply**, whether `diskNameEnforceNamespace` is on or off.
 - **File-based storages** (dir, nfs, cephfs, btrfs): the existing `<vmid>/…<.format>`
   handling in `volume.NewVolume` still applies.
@@ -338,7 +342,8 @@ via `Volume.PV()`.
 - `pkg/csi/parameters_test.go`: parsing `diskName` and `diskNameEnforceNamespace`.
 - New unit tests for expanding templates: every variable, annotation keys with
   `.` and `/`, missing and empty values, invalid characters (rejected, not replaced),
-  the 120-character limit.
+  the 120-character limit, the 128-byte volume ID limit (long region/zone/storage
+  names with a disk name under 120).
 - Namespace-check tests: every row of the example table in
   [Namespace isolation](#namespace-isolation-disknameenforcenamespace), the
   `team-a`/`team` + `a-db` case, literal prefixes, and enforcement off.
@@ -396,8 +401,15 @@ section, not just a parameter list entry.
   - **Local storage on multi-node Proxmox clusters:** use `Immediate` binding or
     shared storage with `diskName`; otherwise a pod scheduled on another node gets
     an error instead of its old disk.
-  - **Size on reuse:** a reused disk grows to the requested size but never shrinks;
-    the PV shows the actual size.
+  - **Size on reuse:** a reused disk grows to the requested size but never shrinks
+    (Proxmox: "Shrinking disk size is not supported"); the PV shows the actual size.
+  - **Destroying a Kubernetes node VM in Proxmox:** `qm destroy` removes the VM "and all
+    used/owned volumes", so PV disks still attached to it are deleted too, even though
+    they are named after the controller VMID. Drain the node (so disks are detached)
+    before destroying its VM.
+  - **Never create a VM with the controller VMID** (default 9999). Destroying it removes
+    all volumes it owns, and with `--destroy-unreferenced-disks` every `vm-9999-*` disk
+    on all storages, which is every PV disk of the driver.
   - **Changing `fstype`** (for example ext4 → xfs): reusing an old disk then fails at
     mount time. The driver never formats a disk that already has a filesystem, so no
     data is lost, but the PVC won't start.
@@ -406,6 +418,39 @@ section, not just a parameter list entry.
 - `docs/config.md`: `k8sClusterName`. Note that `controllerVmID` becomes part of templated
   disk names, so changing it later means existing disks aren't found for reuse.
 - New example StorageClass under `docs/`.
+
+## Verification (Context7, 2026-09-26)
+
+**Confirmed:**
+- **nfs-csi `subDir`** uses exactly `${pvc.metadata.name}`, `${pvc.metadata.namespace}`,
+  `${pv.metadata.name}`, and has `onDelete: delete|retain|archive`. Our naming follows it.
+- **`csi.storage.k8s.io/pvc/namespace`** is a real CreateVolume parameter key; another CSI
+  driver (democratic-csi) builds volume IDs from it.
+- **Keys with the `csi.storage.k8s.io/` prefix are reserved** by the external-provisioner,
+  so our own parameter names (`diskName`, `diskNameEnforceNamespace`) must not use it.
+  They don't.
+- **`Retain`:** deleting the claim leaves the PV `Released` with the data intact, and an
+  admin must clean up by hand. A StorageClass without `reclaimPolicy` defaults to
+  `Delete`.
+- **Proxmox dir storage naming:** `vm-<VMID>-<NAME>.<FORMAT>`, where `<NAME>` is
+  "arbitrary name (ascii) without white space" and `<FORMAT>` is `raw|qcow2|vmdk`. This
+  matches our character set and the `CopyVolume` fix (#5).
+- **Proxmox volume ownership:** image volumes are owned by the VMID in their name. `qm
+  destroy` removes "all used/owned volumes"; `--destroy-unreferenced-disks` also removes
+  unattached disks with that VMID. Added to the docs caveats.
+- **Proxmox cannot shrink disks.** This matches the "grow only" decision.
+- **gopkg.in/yaml.v3:** unknown keys are ignored unless `KnownFields(true)` is set; keys
+  are matched against the `yaml:` tag.
+
+**Not found in Context7 (still from knowledge, verify in e2e or source):**
+- the CSI spec itself: `FailedPrecondition` for "published to another node",
+  `OutOfRange` for `limit_bytes`, and the 128-byte size limit (see open question 6);
+- the external-provisioner's `--extra-create-metadata` flag and the exact keys
+  `csi.storage.k8s.io/pvc/name` and `csi.storage.k8s.io/pv/name`;
+- the `volume.kubernetes.io/selected-node` PVC annotation;
+- that StorageClass `parameters` can't be changed after creation (Context7 only
+  confirmed this for VolumeAttributesClass);
+- LVM, ZFS and RBD naming and length limits.
 
 ## Open questions
 
@@ -420,6 +465,9 @@ section, not just a parameter list entry.
 5. ~~Resizing a reused disk that's too small: resize it, or reject the request?~~
    Decided: grow automatically (only with `diskName`), report actual size, log reuse
    (see needed fixes #3).
+6. ~~Volume ID length.~~ Decided: keep the 120-character disk name limit **and** check
+   that the full volume ID is at most 128 bytes (CSI spec, from knowledge; a
+   third-party driver's docs also cite it). Today's IDs are about 75 bytes.
 
 ## Later / out of scope
 
