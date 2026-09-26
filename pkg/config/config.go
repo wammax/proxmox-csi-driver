@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	yaml "gopkg.in/yaml.v3"
@@ -49,6 +50,10 @@ const (
 	MinControllerVMID = 100
 )
 
+// k8sClusterNameRe matches a DNS label: it must never contain "." or "_", so it can
+// safely appear before the namespace in a diskName template.
+var k8sClusterNameRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+
 // ClustersFeatures specifies the features for the cloud provider.
 type ClustersFeatures struct {
 	// Provider specifies the provider to use. Can be 'default' or 'capmox'.
@@ -57,6 +62,10 @@ type ClustersFeatures struct {
 	// ControllerVMID is the VM ID used by the controller for volume operations (e.g. volume naming).
 	// Default is 9999.
 	ControllerVMID int `yaml:"controllerVmID,omitempty"`
+	// K8sClusterName is the name of this Kubernetes cluster, used by the
+	// ${k8sClusterName} variable of the diskName StorageClass parameter.
+	// Must be a DNS label. No default.
+	K8sClusterName string `yaml:"k8sClusterName,omitempty"`
 }
 
 // ClustersConfig is proxmox multi-cluster cloud config.
@@ -73,6 +82,7 @@ var (
 	ErrInvalidAuthCredentials = errors.New("must specify one of user, token or file credentials, not multiple")
 	ErrInvalidCloudConfig     = errors.New("invalid cloud config")
 	ErrInvalidVMID            = errors.New("invalid VM ID, must be greater than 100")
+	ErrInvalidK8sClusterName  = errors.New("invalid k8sClusterName, must be a DNS label (lowercase a-z, 0-9 and '-', max 63 characters)")
 )
 
 // ReadCloudConfig reads cloud config from a reader.
@@ -126,6 +136,10 @@ func ReadCloudConfig(config io.Reader) (ClustersConfig, error) {
 
 	if cfg.Features.ControllerVMID <= MinControllerVMID {
 		return ClustersConfig{}, fmt.Errorf("invalid VM ID, must be greater than %d", MinControllerVMID)
+	}
+
+	if cfg.Features.K8sClusterName != "" && !k8sClusterNameRe.MatchString(cfg.Features.K8sClusterName) {
+		return ClustersConfig{}, fmt.Errorf("%w: %q", ErrInvalidK8sClusterName, cfg.Features.K8sClusterName)
 	}
 
 	return cfg, nil

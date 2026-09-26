@@ -60,9 +60,14 @@ func NewVolumeFromVolumeID(volume string) (*Volume, error) {
 }
 
 // CopyVolume creates a copy of the volume with a new disk name.
+//
+// Only file-based disks ("<vmid>/<name>.<format>") carry a format extension.
+// Block-storage disk names may contain dots themselves ("vm-9999-ns.data").
 func (v *Volume) CopyVolume(volume string) *Volume {
+	slashIndex := strings.LastIndex(v.disk, "/")
+
 	dotIndex := strings.LastIndex(v.disk, ".")
-	if dotIndex != -1 {
+	if slashIndex != -1 && dotIndex > slashIndex {
 		volume = fmt.Sprintf("%s/%s.%s", v.VMID(), volume, v.disk[dotIndex+1:])
 	}
 

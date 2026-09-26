@@ -141,6 +141,75 @@ func Test_ExtractAndDefaultParameters(t *testing.T) {
 				ReplicateZones: "zone1,zone2",
 			},
 		},
+		{
+			msg: "Disk name",
+			params: map[string]string{
+				csi.StorageIDKey:       "local-lvm",
+				csi.StorageDiskNameKey: "${pvc.metadata.namespace}.${pvc.metadata.name}",
+			},
+			storage: csi.StorageParameters{
+				StorageID: "local-lvm",
+				Backup:    new(false),
+				IOThread:  true,
+				DiskName:  "${pvc.metadata.namespace}.${pvc.metadata.name}",
+			},
+		},
+		{
+			msg: "Disk name without namespace enforcement",
+			params: map[string]string{
+				csi.StorageIDKey:                       "local-lvm",
+				csi.StorageDiskNameKey:                 "${pvc.metadata.name}",
+				csi.StorageDiskNameEnforceNamespaceKey: "false",
+			},
+			storage: csi.StorageParameters{
+				StorageID:                "local-lvm",
+				Backup:                   new(false),
+				IOThread:                 true,
+				DiskName:                 "${pvc.metadata.name}",
+				DiskNameEnforceNamespace: new(false),
+			},
+		},
+		{
+			msg: "Disk name with namespace enforcement",
+			params: map[string]string{
+				csi.StorageIDKey:                       "local-lvm",
+				csi.StorageDiskNameKey:                 "${pvc.metadata.namespace}.x",
+				csi.StorageDiskNameEnforceNamespaceKey: "true",
+			},
+			storage: csi.StorageParameters{
+				StorageID:                "local-lvm",
+				Backup:                   new(false),
+				IOThread:                 true,
+				DiskName:                 "${pvc.metadata.namespace}.x",
+				DiskNameEnforceNamespace: new(true),
+			},
+		},
+		{
+			msg: "Namespace enforcement without disk name is ignored",
+			params: map[string]string{
+				csi.StorageIDKey:                       "local-lvm",
+				csi.StorageDiskNameEnforceNamespaceKey: "false",
+			},
+			storage: csi.StorageParameters{
+				StorageID: "local-lvm",
+				Backup:    new(false),
+				IOThread:  true,
+			},
+		},
+		{
+			msg: "Extra create metadata is ignored",
+			params: map[string]string{
+				csi.StorageIDKey:    "local-lvm",
+				csi.PVCNameKey:      "data",
+				csi.PVCNamespaceKey: "myns",
+				csi.PVNameKey:       "pvc-123",
+			},
+			storage: csi.StorageParameters{
+				StorageID: "local-lvm",
+				Backup:    new(false),
+				IOThread:  true,
+			},
+		},
 	}
 
 	for _, testCase := range tests {
@@ -218,6 +287,34 @@ func Test_ToMap(t *testing.T) {
 				"replicate":       "0",
 				"resizeRequired":  "1",
 				"resizeSizeBytes": "1073741824",
+			},
+		},
+		{
+			msg: "Disk name",
+			storage: csi.StorageParameters{
+				StorageID: "local-lvm",
+				DiskName:  "${pvc.metadata.namespace}.${pvc.metadata.name}",
+			},
+			params: map[string]string{
+				"diskName":  "${pvc.metadata.namespace}.${pvc.metadata.name}",
+				"iothread":  "0",
+				"replicate": "0",
+				"storage":   "local-lvm",
+			},
+		},
+		{
+			msg: "Disk name without namespace enforcement",
+			storage: csi.StorageParameters{
+				StorageID:                "local-lvm",
+				DiskName:                 "${pvc.metadata.name}",
+				DiskNameEnforceNamespace: new(false),
+			},
+			params: map[string]string{
+				"diskName":                 "${pvc.metadata.name}",
+				"diskNameEnforceNamespace": "0",
+				"iothread":                 "0",
+				"replicate":                "0",
+				"storage":                  "local-lvm",
 			},
 		},
 	}

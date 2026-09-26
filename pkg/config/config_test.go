@@ -209,6 +209,33 @@ clusters:
 				},
 			},
 		},
+		{
+			msg: "valid config with k8sClusterName",
+			config: strings.NewReader(`
+features:
+  k8sClusterName: prod-k8s
+clusters:
+  - url: https://example.com
+    token_id: "ha"
+    token_secret: "secret"
+    region: cluster-1
+`),
+			expected: &providerconfig.ClustersConfig{
+				Features: providerconfig.ClustersFeatures{
+					Provider:       providerconfig.ProviderDefault,
+					ControllerVMID: providerconfig.DefaultControllerVMID,
+					K8sClusterName: "prod-k8s",
+				},
+				Clusters: []*pxpool.ClusterConfig{
+					{
+						URL:         "https://example.com",
+						TokenID:     "ha",
+						TokenSecret: "secret",
+						Region:      "cluster-1",
+					},
+				},
+			},
+		},
 	}
 
 	for _, testCase := range tests {
@@ -239,4 +266,21 @@ func TestReadCloudConfigFromFile(t *testing.T) {
 	assert.Nil(t, err)
 	assert.NotNil(t, cfg)
 	assert.Equal(t, 2, len(cfg.Clusters))
+}
+
+func TestReadCloudConfigInvalidK8sClusterName(t *testing.T) {
+	for _, name := range []string{"prod.k8s", "prod_k8s", "Prod-k8s", "-prod", "prod-", strings.Repeat("a", 64)} {
+		t.Run(name, func(t *testing.T) {
+			_, err := providerconfig.ReadCloudConfig(strings.NewReader(`
+features:
+  k8sClusterName: "` + name + `"
+clusters:
+  - url: https://example.com
+    token_id: "ha"
+    token_secret: "secret"
+    region: cluster-1
+`))
+			assert.ErrorIs(t, err, providerconfig.ErrInvalidK8sClusterName)
+		})
+	}
 }

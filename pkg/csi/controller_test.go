@@ -40,8 +40,9 @@ var _ proto.ControllerServer = (*csi.ControllerService)(nil)
 type baseCSITestSuite struct {
 	suite.Suite
 
-	s    *csi.ControllerService
-	fake *fakeapi.Cluster
+	s       *csi.ControllerService
+	fake    *fakeapi.Cluster
+	kclient clientkubernetes.Interface
 }
 
 type configTestCase struct {
@@ -71,6 +72,7 @@ func (ts *baseCSITestSuite) setupTestSuite(t *testing.T, config string) error {
 	}
 
 	ts.s = px
+	ts.kclient = kclient
 	ts.s.Init()
 
 	return nil

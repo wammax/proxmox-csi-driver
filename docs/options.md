@@ -47,6 +47,10 @@ parameters:
   replicateSchedule: "*/15"
   replicateZones: "pve-1,pve-3"
 
+  ## Optional: Predictable disk name, see disk-name.md
+  diskName: "${pvc.metadata.namespace}.${pvc.metadata.name}"
+  diskNameEnforceNamespace: "true"
+
 # Optional: This field allows you to specify additional mount options to be applied when the volume is mounted on the node
 mountOptions:
   # Common for ssd
@@ -129,6 +133,9 @@ metadata:
 * `replicate` - set true if you want to replicate the disk to another zone
 * `replicateSchedule` - replication schedule [in systemd calendar format](https://pve.proxmox.com/pve-docs/pve-admin-guide.html#pvesr_schedule_time_format) (default: `*/15`)
 * `replicateZones` - zones where the disk will be replicated, separated by commas, support up to 2 zones
+
+* `diskName` - template for the Proxmox disk name, for example `${pvc.metadata.namespace}.${pvc.metadata.name}`. A recreated PVC with the same namespace and name gets its old disk back (use `reclaimPolicy: Retain`). Can't be combined with `replicate`. See [Disk names](disk-name.md) for the variables, the naming rules and the checks that keep namespaces apart.
+* `diskNameEnforceNamespace` - `true` (default) checks that the `diskName` template keeps the disks of different namespaces apart. `false` turns the check off. See [Disk names](disk-name.md#keeping-namespaces-apart).
 
 ## AllowVolumeExpansion
 

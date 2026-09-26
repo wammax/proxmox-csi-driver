@@ -46,6 +46,11 @@ const (
 
 	// StorageInodeSizeKey the inode size when formatting a volume
 	StorageInodeSizeKey = "inodeSize"
+
+	// StorageDiskNameKey is the disk name template, see docs/disk-name.md
+	StorageDiskNameKey = "diskName"
+	// StorageDiskNameEnforceNamespaceKey enforces namespace isolation of the disk name template (default true)
+	StorageDiskNameEnforceNamespaceKey = "diskNameEnforceNamespace"
 )
 
 // StorageParameters contains storage parameters
@@ -75,6 +80,11 @@ type StorageParameters struct {
 	Replicate         bool   `json:"replicate,omitempty"   cfg:"replicate"`
 	ReplicateSchedule string `json:"replicateSchedule,omitempty"`
 	ReplicateZones    string `json:"replicateZones,omitempty"`
+
+	// DiskName and DiskNameEnforceNamespace only appear in the volume context when set,
+	// so volumes without a disk name template keep exactly the same attributes.
+	DiskName                 string `json:"diskName,omitempty"`
+	DiskNameEnforceNamespace *bool  `json:"diskNameEnforceNamespace,omitempty"`
 
 	ResizeRequired  *bool `json:"resizeRequired,omitempty"`
 	ResizeSizeBytes int64 `json:"resizeSizeBytes,omitempty"`
@@ -113,6 +123,12 @@ func ExtractParameters(parameters map[string]string) (StorageParameters, error) 
 	// SSD emulation implies discard, unless discard was set explicitly.
 	if p.Discard == "" && p.SSD != nil && *p.SSD {
 		p.Discard = "on"
+	}
+
+	// diskNameEnforceNamespace has no meaning without a disk name template,
+	// keep it out of the volume context.
+	if p.DiskName == "" {
+		p.DiskNameEnforceNamespace = nil
 	}
 
 	if p.Iops != nil && *p.Iops > 0 {

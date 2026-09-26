@@ -100,6 +100,7 @@ spec:
             - "--csi-address=unix:///csi/csi.sock"
             - "--timeout={{ .Values.timeout }}"
             - "--leader-election"
+            - "--extra-create-metadata"
             {{- if .Values.options.enableCapacity }}
             - "--enable-capacity"
             - "--capacity-ownerref-level=2"

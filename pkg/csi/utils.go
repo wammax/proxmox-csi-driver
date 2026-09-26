@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	proto "github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/siderolabs/go-retry/retry"
 
 	pxpool "github.com/sergelogvinov/go-proxmox-pool"
@@ -216,7 +217,7 @@ func getVMByAttachedVolume(ctx context.Context, cl *proxmoxrest.Client, vol *vol
 				return false, err
 			}
 
-			l, exist := isVolumeAttached(cfg, vol.Disk())
+			l, exist := isVolumeAttached(cfg, vol.VolID())
 			if exist {
 				lun = l
 			}
@@ -279,15 +280,17 @@ func getVolumeSize(ctx context.Context, cl *proxmoxrest.Client, vol *volume.Volu
 	return st.Size, nil
 }
 
-// isVolumeAttached reports whether pvc is attached to a guest with the given
-// configuration, returning the SCSI lun it's attached at.
-func isVolumeAttached(cfg *qemu.Config, pvc string) (int, bool) {
-	if pvc == "" {
+// isVolumeAttached reports whether the volume volID ("<storage>:<disk>") is
+// attached to a guest with the given configuration, returning the SCSI lun it's
+// attached at. The volume ID must match exactly: with templated disk names one
+// name can be a prefix of another ("vm-9999-ns.data" and "vm-9999-ns.data2").
+func isVolumeAttached(cfg *qemu.Config, volID string) (int, bool) {
+	if volID == "" {
 		return 0, false
 	}
 
 	for lun, disk := range cfg.SCSI {
-		if strings.Contains(disk.File, pvc) {
+		if disk.File == volID {
 			return lun, true
 		}
 	}
@@ -601,7 +604,7 @@ func attachVolume(ctx context.Context, cl *proxmoxrest.Client, id int, vol *volu
 
 	wwm := ""
 
-	lun, exist := isVolumeAttached(cfg, vol.Disk())
+	lun, exist := isVolumeAttached(cfg, vol.VolID())
 	if exist {
 		wwm = hex.EncodeToString(fmt.Appendf(nil, "PVC-ID%02d", lun))
 	} else {
@@ -663,7 +666,7 @@ func detachVolume(ctx context.Context, cl *proxmoxrest.Client, id int, vol *volu
 		return fmt.Errorf("failed to get vm config: %v", err)
 	}
 
-	if lun, ok := isVolumeAttached(cfg, vol.Disk()); ok {
+	if lun, ok := isVolumeAttached(cfg, vol.VolID()); ok {
 		device := deviceNamePrefix + strconv.Itoa(lun)
 
 		if err := cl.Nodes(node).Qemu().Unlink(ctx, id, &qemu.UnlinkOptions{IDList: []string{device}}); err != nil {
@@ -685,7 +688,7 @@ func updateVolume(ctx context.Context, cl *proxmoxrest.Client, id int, vol *volu
 		return fmt.Errorf("failed to get vm config: %v", err)
 	}
 
-	lun, ok := isVolumeAttached(cfg, vol.Disk())
+	lun, ok := isVolumeAttached(cfg, vol.VolID())
 	if !ok {
 		return fmt.Errorf("volume is not attached to VM %d", id)
 	}
@@ -758,7 +761,7 @@ func waitAttachVolume(ctx context.Context, cl *proxmoxrest.Client, id int, vol *
 			return fmt.Errorf("failed to get vm config: %v", err)
 		}
 
-		if _, ok := isVolumeAttached(cfg, vol.Disk()); ok {
+		if _, ok := isVolumeAttached(cfg, vol.VolID()); ok {
 			return nil
 		}
 
@@ -791,7 +794,7 @@ func waitDetachVolume(ctx context.Context, cl *proxmoxrest.Client, id int, vol *
 			return fmt.Errorf("failed to get vm config: %v", err)
 		}
 
-		if _, ok := isVolumeAttached(cfg, vol.Disk()); ok {
+		if _, ok := isVolumeAttached(cfg, vol.VolID()); ok {
 			return retry.ExpectedError(fmt.Errorf("volume %s still attached to VM %d", vol.VolumeID(), id))
 		}
 
@@ -835,4 +838,95 @@ func defaultVMConfig() *qemu.Config {
 		Memory:  &qemu.Memory{Current: new(512)},
 		SCSIHW:  "virtio-scsi-single",
 	}
+}
+
+// findLocalDisk looks for disk on the local storage storageID: first on zone,
+// then on every other node the storage is available on. It returns the node the
+// disk was found on, or "" if it doesn't exist.
+func findLocalDisk(ctx context.Context, cl *proxmoxrest.Client, region, zone, storageID, disk, format string) (string, error) {
+	nodes, err := storageNodes(ctx, cl, storageID)
+	if err != nil {
+		return "", err
+	}
+
+	// The requested zone first.
+	slices.SortStableFunc(nodes, func(a, b string) int {
+		switch {
+		case a == zone && b != zone:
+			return -1
+		case b == zone && a != zone:
+			return 1
+		}
+
+		return 0
+	})
+
+	for _, node := range nodes {
+		_, err := getVolumeSize(ctx, cl, volume.NewVolume(region, node, storageID, disk, format))
+		if err == nil {
+			return node, nil
+		}
+
+		if err.Error() != ErrorNotFound {
+			return "", err
+		}
+	}
+
+	return "", nil
+}
+
+// topologyAllowsZone reports whether a volume in region/zone satisfies the
+// requisite topology of a CreateVolume request. No requisite means any zone.
+func topologyAllowsZone(tr *proto.TopologyRequirement, region, zone string) bool {
+	requisite := tr.GetRequisite()
+	if len(requisite) == 0 {
+		return true
+	}
+
+	for _, top := range requisite {
+		r, z := GetNodeTopology(top.GetSegments())
+		if r == region && (z == "" || z == zone) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// vmsWithAttachedVolume returns the IDs of all VMs that have vol attached,
+// except the volume owner VM (the controller VM ID used for the disk name).
+func vmsWithAttachedVolume(ctx context.Context, cl *proxmoxrest.Client, vol *volume.Volume) ([]int, error) {
+	nodes, err := volumeNodes(ctx, cl, vol)
+	if err != nil {
+		return nil, err
+	}
+
+	resources, err := cl.Cluster().Resources().List(ctx, pxcluster.ListFilter{
+		Type:      pxcluster.ResourceTypeVM,
+		GuestType: guestTypeQemu,
+		Match: func(rs *pxcluster.Resource) (bool, error) {
+			if vol.VMID() == strconv.Itoa(rs.VMID) || !slices.Contains(nodes, rs.Node) {
+				return false, nil
+			}
+
+			cfg, err := cl.Nodes(rs.Node).Qemu().Config(ctx, rs.VMID, nil)
+			if err != nil {
+				return false, err
+			}
+
+			_, exist := isVolumeAttached(cfg, vol.VolID())
+
+			return exist, nil
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ids := make([]int, 0, len(resources))
+	for _, rs := range resources {
+		ids = append(ids, rs.VMID)
+	}
+
+	return ids, nil
 }

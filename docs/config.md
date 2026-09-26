@@ -10,6 +10,9 @@ features:
   # Default is 9999, which is a safe value that is unlikely to conflict with existing VMs.
   # You can change it if needed, but make sure to choose a value that is not used by any existing VM in your Proxmox cluster.
   controllerVMID: 9999
+  # Kubernetes cluster name, used by ${k8sClusterName} in the diskName StorageClass parameter.
+  # Must be a DNS label (a-z, 0-9, '-', max 63 characters). No default.
+  k8sClusterName: prod-k8s
 
 clusters:
   # List of Proxmox clusters
@@ -47,3 +50,6 @@ You can define multiple clusters in the `clusters` section.
 ## Feature flags
 
 * `provider` - Set the provider type. The default is `default`, which uses provider-id to define the Proxmox VM ID. The `capmox` value is used for working with the Cluster API for Proxmox (CAPMox).
+* `k8sClusterName` - The name of this Kubernetes cluster, used by the `${k8sClusterName}` variable of the `diskName` StorageClass parameter. Give every Kubernetes cluster that shares a Proxmox storage its own name, so their disk names can't collide. Must be a DNS label (lowercase `a-z`, `0-9` and `-`, max 63 characters). There is no default. See [Disk names](disk-name.md).
+
+Note: `controllerVmID` and `k8sClusterName` are part of the disk names created with `diskName`. Changing them later means existing disks are no longer found for reuse.

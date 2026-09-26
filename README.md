@@ -32,6 +32,7 @@ It enables the use of a single storage class to deploy one or many deployments/s
 * [Volume migration](docs/pvecsictl.md): Offline migration of PV to another Proxmox node (region).
 * [Volume attributes class](docs/options.md): Detailed options for StorageClass.
 * [Volume zone replication](docs/options.md): ZFS replication to another Proxmox node (zone).
+* [Disk names](docs/disk-name.md): Predictable disk names from a template, so a recreated PVC gets its old disk back.
 * [Volume snapshots](https://kubernetes.io/docs/concepts/storage/volume-snapshots/): Create and restore volume snapshots. See [limits](docs/volumesnapshot.md) in the documentation.
 
 ## Overview

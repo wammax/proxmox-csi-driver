@@ -1,7 +1,7 @@
 # Plan: templated disk names (`diskName`)
 
-Status: **planning done, ready to implement** — all open questions decided, live
-verification and e2e baseline done.
+Status: **implemented** on `feat/volume-name-template` (2026-09-26), unit tests, lint and
+live tests pass. See [Implementation](#implementation-2026-09-26).
 
 ## Goal
 
@@ -183,7 +183,7 @@ Without `diskName`, the driver must behave exactly as before: same Proxmox calls
 volume IDs, same PV attributes.
 
 - **Scoped to `diskName`:** template expansion, all name checks (characters, 120/128,
-  LVM), the PV check, the attach check, the all-nodes search, growing a reused disk,
+  LVM), the PV check, the attach check, the all-nodes search, rejecting a too-small reused disk,
   **reporting the actual size of a larger disk**, the reuse log line, blocking
   `replicate`, the PVC lookup for annotations.
 - **`diskNameEnforceNamespace` is a `*bool`** (json tag `diskNameEnforceNamespace`),
@@ -220,11 +220,17 @@ volume IDs, same PV attributes.
 3. **Size of a reused disk.** Today, without a source volume, `CreateVolume` only logs
    "volume has been created with different capacity" and reports the *requested*
    size, whatever the disk's actual size is. Proxmox disks can only grow. Decided:
-   - **Too small:** grow automatically, **only when `diskName` is set**. Reuse the
-     existing clone/snapshot path: set `ResizeRequired` / `ResizeSizeBytes`, so
-     `ControllerPublishVolume` grows the disk after attaching (`controller.go:603`)
-     and `NodeStageVolume` grows the filesystem (`node.go:210`). Classic
-     `pvc-<uuid>` volumes keep today's behaviour.
+   - **Too small:** ~~grow automatically on attach~~ **Changed during implementation
+     (user decision, option 1): reject** with `OutOfRange`, for example `existing disk …
+     is 1Gi, but the PVC requests 2Gi; request at most 1Gi and expand the PVC
+     afterwards`. Growing goes through normal PVC expansion.
+     - Why: the live test showed that Kubernetes identifies a CSI volume by driver +
+       volume handle. When a PVC is recreated before the old attachment is gone,
+       Kubernetes keeps the old attachment and never calls `ControllerPublishVolume` for
+       the new PV, so "grow on attach" silently didn't happen (the PV claimed 2 GiB, the
+       disk had 1 GiB). With a full detach first it worked, so it was timing-dependent.
+     - Reporting the smaller real size instead isn't safe: the external-provisioner
+       treats a volume smaller than requested as failed and deletes it (from knowledge).
    - **Larger than requested (only with `diskName`):** report the disk's **actual** size as
      `CapacityBytes`. If it exceeds the request's `limit_bytes`, return `OutOfRange`
      (CSI spec).
@@ -293,7 +299,7 @@ volume IDs, same PV attributes.
        (`Immediate` binding), use it and return its topology. If not
        (`WaitForFirstConsumer` already picked a node), **fail with a clear error**
        instead of creating a duplicate.
-3. **Found → reuse** (grow if too small, see needed fixes #3). **Not found → create.**
+3. **Found → reuse** (rejected if too small, see needed fixes #3). **Not found → create.**
 
 **`ControllerPublishVolume`:**
 
@@ -398,8 +404,8 @@ via `Volume.PV()`.
 - `pkg/csi/controller_test.go`: `CreateVolume` with `diskName`:
   - a new disk is created;
   - an existing disk is reused (no create call);
-  - a smaller reused disk gets `ResizeRequired` / `ResizeSizeBytes`; a larger one
-    reports its actual size; larger than `limit_bytes` gives `OutOfRange`;
+  - a smaller reused disk is rejected with `OutOfRange`; a larger one reports its actual
+    size; larger than `limit_bytes` gives `OutOfRange`;
   - without `diskName`, the size behaviour is unchanged;
   - PV check: another `Bound`/`Available`/`Pending` PV with the same volume handle
     gives an error; `Released`/`Failed` PVs are ignored;
@@ -511,8 +517,9 @@ section, not just a parameter list entry.
   - **Local storage on multi-node Proxmox clusters:** use `Immediate` binding or
     shared storage with `diskName`; otherwise a pod scheduled on another node gets
     an error instead of its old disk.
-  - **Size on reuse:** a reused disk grows to the requested size but never shrinks
-    (Proxmox: "Shrinking disk size is not supported"); the PV shows the actual size.
+  - **Size on reuse:** a reused disk is never resized on reuse; smaller than the request
+    is rejected (grow via PVC expansion), larger keeps its size (Proxmox: "Shrinking disk
+    size is not supported") and the PV shows the actual size.
   - **Destroying a Kubernetes node VM in Proxmox:** `qm destroy` removes the VM "and all
     used/owned volumes", so PV disks still attached to it are deleted too, even though
     they are named after the controller VMID. Drain the node (so disks are detached)
@@ -528,6 +535,54 @@ section, not just a parameter list entry.
 - `docs/config.md`: `k8sClusterName`. Note that `controllerVmID` becomes part of templated
   disk names, so changing it later means existing disks aren't found for reuse.
 - New example StorageClass under `docs/`.
+
+## Implementation (2026-09-26)
+
+**Code:**
+- `pkg/config/config.go`: `features.k8sClusterName`, checked as a DNS label.
+- `pkg/csi/parameters.go`: `diskName` (string) and `diskNameEnforceNamespace` (`*bool`,
+  dropped when `diskName` isn't set).
+- `pkg/csi/diskname.go` (new): template parsing, namespace check, expansion, length
+  and LVM device-mapper checks.
+- `pkg/csi/controller.go`: `CreateVolume` (template, `replicate` rejected before any VM
+  is created, all-nodes search for local storage, 128-byte volume ID check, PV check,
+  too-small reuse rejected, larger reuse reports its size) and `ControllerPublishVolume`
+  (refuses a disk attached to another VM, only for `diskName` volumes).
+- `pkg/csi/utils.go`: `isVolumeAttached` now compares the **full volume ID**
+  (`storage:disk`), not only the disk part as planned: with templates, two
+  StorageClasses on different storages can produce the same disk name. New helpers
+  `findLocalDisk`, `topologyAllowsZone`, `vmsWithAttachedVolume`.
+- `pkg/utils/volume/volume.go`: `CopyVolume` only treats the end as a format when the
+  disk uses the file-based `<vmid>/…` layout.
+- `Volume.PV()` unchanged: only reached through replication, which `diskName` excludes.
+- Chart 0.6.0: `--extra-create-metadata` always on, commented examples in `values.yaml`,
+  README regenerated with helm-docs (only the version badge changed).
+- Docs: new `docs/disk-name.md` and `docs/proxmox-disk-name.yaml`, links from
+  `docs/options.md`, `docs/config.md` and `README.md`.
+
+**Checks:** `make lint` 0 issues, `make unit` passes (both provider configs), `helm lint`
+and `helm template` pass. A mutation check (reverting `isVolumeAttached` to "contains",
+disabling the attach check) makes the new tests fail as expected.
+
+**Regression e2e without `diskName`** (k8s-a, new build): identical to the baseline:
+`capacity` and `attributes` pass, `snapshot-zones` skips, `lifecycle` fails at the same
+step for the same single-node reason.
+
+**Live `diskName` tests** (script driven, k8s-a and k8s-b, all cleaned up afterwards):
+
+| Scenario | Result |
+|---|---|
+| Reuse on LVM-thin, ZFS, directory (qcow2): create, delete PVC (`Retain`), recreate same size | pass: same disk and volume handle, data kept |
+| Recreate with a bigger size | pass: rejected with the "request at most 1Gi" message, disk untouched |
+| Then PVC expansion to 2 GiB | pass on all three: filesystem grown, data kept |
+| Two PVCs mapping to one disk (enforcement off) | pass: second PVC rejected, error names the bound PV |
+| Template with `-` after the namespace | pass: rejected, error suggests the fix |
+| Same PVC in k8s-a and k8s-b with `${k8sClusterName}` | pass: two separate disks, each cluster sees its own data |
+| Disk in use by k8s-a, requested by k8s-b (no cluster name in template) | pass: attach refused ("attached to VM 101"), disk not attached to VM 102 |
+
+**Test env changes:** `k8sClusterName: k8s-a` / `k8s-b` added to
+`/root/dev/values-k8s-{a,b}.yaml` (backups `*.bak-diskname`); helm-docs installed on
+the builder (`/root/go/bin/helm-docs`).
 
 ## Verification (Context7, 2026-09-26)
 
@@ -586,7 +641,7 @@ release rolled back afterwards.
   LVM-thin with "Failed to set device name" (nothing left behind). Device-mapper names
   are `<vg>-<lv>` with every `-` doubled and must stay under 128 characters. With VG
   `pve`, a 120-character name can contain only about 3 hyphens. Typical names are far
-  below this (`vm-9999-myns.data.prod-k8s`: 26 characters, 4 hyphens → 34). See open
+  below this (`vm-9999-myns.data.prod-k8s`: 26 characters, 3 hyphens → 33). See open
   question 7.
 
 ## Open questions
@@ -600,8 +655,8 @@ release rolled back afterwards.
    rejected not replaced, 120 characters total; `.`/`_` as namespace separator,
    relaxed prefix rule (see naming rules and namespace isolation).
 5. ~~Resizing a reused disk that's too small: resize it, or reject the request?~~
-   Decided: grow automatically (only with `diskName`), report actual size, log reuse
-   (see needed fixes #3).
+   Decided: grow automatically (only with `diskName`), report actual size, log reuse.
+   **Changed after the live test: reject** (see needed fixes #3).
 6. ~~Volume ID length.~~ Decided: keep the 120-character disk name limit **and** check
    that the full volume ID is at most 128 bytes (CSI spec, from knowledge; a
    third-party driver's docs also cite it). Today's IDs are about 75 bytes.

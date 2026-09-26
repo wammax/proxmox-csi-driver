@@ -45,6 +45,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
@@ -78,6 +79,9 @@ type ControllerService struct {
 	Provider csiconfig.Provider
 	vmID     int
 
+	// k8sClusterName is the value of ${k8sClusterName} in diskName templates.
+	k8sClusterName string
+
 	storageCapacity *cache.Cache
 	vmLocks         *VMLocks
 }
@@ -99,6 +103,8 @@ func NewControllerService(kclient kubernetes.Interface, cloudConfig string) (*Co
 		kclient:  kclient,
 		Provider: cfg.Features.Provider,
 		vmID:     cfg.Features.ControllerVMID,
+
+		k8sClusterName: cfg.Features.K8sClusterName,
 	}
 
 	d.Init()
@@ -154,6 +160,25 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
 
 	if params.StorageID == "" {
 		return nil, status.Error(codes.InvalidArgument, "parameter storage must be provided")
+	}
+
+	var diskTemplate *diskNameTemplate
+
+	if params.DiskName != "" {
+		if params.Replicate {
+			return nil, status.Error(codes.InvalidArgument, "parameter diskName can't be combined with replicate")
+		}
+
+		diskTemplate, err = parseDiskNameTemplate(params.DiskName)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+
+		if params.DiskNameEnforceNamespace == nil || *params.DiskNameEnforceNamespace {
+			if err = diskTemplate.checkNamespaceIsolation(); err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+		}
 	}
 
 	volSizeBytes := DefaultVolumeSizeBytes
@@ -335,11 +360,85 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
 		}
 	}
 
-	vol := volume.NewVolume(region, zone, params.StorageID, fmt.Sprintf("vm-%d-%s", id, pvc), format)
+	diskName := fmt.Sprintf("vm-%d-%s", id, pvc)
+
+	if diskTemplate != nil {
+		diskName, err = d.expandDiskName(ctx, diskTemplate, request.GetParameters(), region, zone)
+		if err != nil {
+			klog.ErrorS(err, "CreateVolume: failed to build disk name", "cluster", region, "diskName", params.DiskName)
+
+			return nil, err
+		}
+
+		if (storageConfig.Type == "lvm" || storageConfig.Type == "lvmthin") && storageConfig.VGName != nil { // nolint: goconst
+			if err = checkLVMDeviceName(*storageConfig.VGName, diskName); err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+		}
+	}
+
+	vol := volume.NewVolume(region, zone, params.StorageID, diskName, format)
+
+	if diskTemplate != nil {
+		// A local disk may already exist on another node. Reuse it there if the
+		// topology allows it, never create a second disk with the same name.
+		// A template with ${zone} gives every node its own name, nothing to search.
+		if !storageConfig.Shared && !diskTemplate.uses(diskNameVarZone) {
+			found, err := findLocalDisk(ctx, cl, region, zone, params.StorageID, diskName, format)
+			if err != nil {
+				klog.ErrorS(err, "CreateVolume: failed to search for existing disk", "cluster", region, "disk", diskName)
+
+				return nil, status.Errorf(codes.Internal, "failed to search for existing disk %s: %v", diskName, err)
+			}
+
+			if found != "" && found != zone {
+				if !topologyAllowsZone(accessibleTopology, region, found) {
+					return nil, status.Errorf(codes.FailedPrecondition,
+						"disk %s already exists on Proxmox node %s, but the volume has to be created on %s; use volumeBindingMode: Immediate or shared storage to reuse disks across nodes",
+						diskName, found, zone)
+				}
+
+				klog.InfoS("CreateVolume: disk exists on another node, using that node", "cluster", region, "disk", diskName, "zone", found, "requestedZone", zone)
+
+				zone = found
+				vol = volume.NewVolume(region, zone, params.StorageID, diskName, format)
+				topology = []*csi.Topology{
+					{
+						Segments: map[string]string{
+							corev1.LabelTopologyRegion: region,
+							corev1.LabelTopologyZone:   zone,
+						},
+					},
+				}
+			}
+		}
+
+		if len(vol.VolumeID()) > MaxVolumeIDLength {
+			return nil, status.Errorf(codes.InvalidArgument, "volume ID %q is %d bytes long, the maximum is %d; shorten the diskName template (disk name %q is %d characters)",
+				vol.VolumeID(), len(vol.VolumeID()), MaxVolumeIDLength, vol.Disk(), len(vol.Disk()))
+		}
+
+		if err = d.checkDiskNotInUse(ctx, vol.VolumeID(), vol.VolumeSharedID()); err != nil {
+			return nil, err
+		}
+	}
 
 	klog.V(5).InfoS("CreateVolume: creating volume", "cluster", region, "zone", zone, "volumeID", vol.VolumeID(), "size", volSizeBytes)
 
 	size, err := getVolumeSize(ctx, cl, vol)
+	if err == nil && diskTemplate != nil {
+		// A reused disk is never grown here: Kubernetes may keep the old attachment
+		// of the same volume handle and never call ControllerPublishVolume, so a
+		// grow on attach isn't reliable. Growing goes through PVC expansion.
+		if size < volSizeBytes {
+			return nil, status.Errorf(codes.OutOfRange,
+				"existing disk %s is %s, but the PVC requests %s; request at most %s and expand the PVC afterwards",
+				vol.VolumeID(), resource.NewQuantity(size, resource.BinarySI), resource.NewQuantity(volSizeBytes, resource.BinarySI), resource.NewQuantity(size, resource.BinarySI))
+		}
+
+		klog.InfoS("CreateVolume: reusing existing disk", "cluster", region, "volumeID", vol.VolumeID(), "size", size, "requestedSize", volSizeBytes)
+	}
+
 	if err != nil {
 		if err.Error() != ErrorNotFound {
 			klog.ErrorS(err, "CreateVolume: failed to check volume", "cluster", region, "volumeID", vol.VolumeID())
@@ -416,6 +515,17 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
 		}
 	}
 
+	capacityBytes := volSizeBytes
+
+	if diskTemplate != nil && size > volSizeBytes {
+		// Proxmox can't shrink disks, report the real size of a larger reused disk.
+		if limit := request.GetCapacityRange().GetLimitBytes(); limit > 0 && size > limit {
+			return nil, status.Errorf(codes.OutOfRange, "existing disk %s is %d bytes, larger than the limit of %d bytes", vol.VolumeID(), size, limit)
+		}
+
+		capacityBytes = size
+	}
+
 	volumeID := vol.VolumeID()
 
 	if params.Replicate {
@@ -431,13 +541,13 @@ func (d *ControllerService) CreateVolume(ctx context.Context, request *csi.Creat
 		volumeID = vol.VolumeSharedID()
 	}
 
-	klog.V(3).InfoS("CreateVolume: volume created", "cluster", vol.Cluster(), "volumeID", volumeID, "size", volSizeBytes)
+	klog.V(3).InfoS("CreateVolume: volume created", "cluster", vol.Cluster(), "volumeID", volumeID, "size", capacityBytes)
 
 	volume := csi.Volume{
 		VolumeId:           volumeID,
 		VolumeContext:      paramsVAC.MergeMap(params.ToMap()),
 		ContentSource:      contentSource,
-		CapacityBytes:      volSizeBytes,
+		CapacityBytes:      capacityBytes,
 		AccessibleTopology: topology,
 	}
 
@@ -577,6 +687,23 @@ func (d *ControllerService) ControllerPublishVolume(ctx context.Context, request
 		klog.ErrorS(err, "ControllerPublishVolume: failed to check volume", "cluster", vol.Cluster(), "volumeID", vol.VolumeID())
 
 		return nil, err
+	}
+
+	// A disk with a templated name may be reused, so it could still be attached
+	// somewhere else: never attach it to a second VM.
+	if params.DiskName != "" {
+		ids, err := vmsWithAttachedVolume(ctx, cl, vol)
+		if err != nil {
+			klog.ErrorS(err, "ControllerPublishVolume: failed to check volume attachments", "cluster", vol.Cluster(), "volumeID", vol.VolumeID())
+
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		for _, other := range ids {
+			if other != id {
+				return nil, status.Errorf(codes.FailedPrecondition, "volume %s is attached to VM %d, detach it there before it can be attached to VM %d", vol.VolumeID(), other, id)
+			}
+		}
 	}
 
 	d.vmLocks.Lock(n.GetNodeName())
@@ -1195,4 +1322,83 @@ func (d *ControllerService) checkVolume(ctx context.Context, vol *volume.Volume)
 	}
 
 	return size, nil
+}
+
+// expandDiskName builds the full disk name from a diskName template.
+// It returns gRPC status errors.
+func (d *ControllerService) expandDiskName(ctx context.Context, tpl *diskNameTemplate, parameters map[string]string, region, zone string) (string, error) {
+	values := diskNameValues{
+		PVCNamespace:   parameters[PVCNamespaceKey],
+		PVCName:        parameters[PVCNameKey],
+		PVName:         parameters[PVNameKey],
+		K8sClusterName: d.k8sClusterName,
+		Region:         region,
+		Zone:           zone,
+	}
+
+	if tpl.usesAnnotations() {
+		if values.PVCNamespace == "" || values.PVCName == "" {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"diskName %q uses PVC annotations, but the request has no %q/%q parameters; start csi-provisioner with --extra-create-metadata",
+				tpl.raw, PVCNamespaceKey, PVCNameKey)
+		}
+
+		if d.kclient == nil {
+			return "", status.Error(codes.Internal, "kubernetes client is not configured, can't read PVC annotations")
+		}
+
+		pvc, err := d.kclient.CoreV1().PersistentVolumeClaims(values.PVCNamespace).Get(ctx, values.PVCName, metav1.GetOptions{})
+		if err != nil {
+			return "", status.Errorf(codes.Internal, "failed to get PVC %s/%s: %v", values.PVCNamespace, values.PVCName, err)
+		}
+
+		values.Annotations = pvc.Annotations
+	}
+
+	suffix, err := tpl.expand(values)
+	if err != nil {
+		return "", status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	name, err := templatedDiskName(d.vmID, suffix)
+	if err != nil {
+		return "", status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	return name, nil
+}
+
+// checkDiskNotInUse fails if another PersistentVolume that is still in use
+// (Bound, Available or Pending) refers to the same volume handle.
+// Released and Failed PVs are ignored: reusing their disk is the purpose of diskName.
+func (d *ControllerService) checkDiskNotInUse(ctx context.Context, volumeIDs ...string) error {
+	if d.kclient == nil {
+		return status.Error(codes.Internal, "kubernetes client is not configured, can't check PersistentVolumes")
+	}
+
+	pvs, err := d.kclient.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to list PersistentVolumes: %v", err)
+	}
+
+	for _, pv := range pvs.Items {
+		if pv.Spec.CSI == nil || pv.Spec.CSI.Driver != DriverName || !slices.Contains(volumeIDs, pv.Spec.CSI.VolumeHandle) {
+			continue
+		}
+
+		if pv.Status.Phase == corev1.VolumeReleased || pv.Status.Phase == corev1.VolumeFailed {
+			continue
+		}
+
+		claim := ""
+		if ref := pv.Spec.ClaimRef; ref != nil {
+			claim = ref.Namespace + "/" + ref.Name
+		}
+
+		return status.Errorf(codes.FailedPrecondition,
+			"disk %s is still used by PersistentVolume %s (phase %s, claim %q); a disk is only reused when its old PersistentVolume is Released",
+			pv.Spec.CSI.VolumeHandle, pv.Name, pv.Status.Phase, claim)
+	}
+
+	return nil
 }

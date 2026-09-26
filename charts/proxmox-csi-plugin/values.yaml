@@ -60,6 +60,10 @@ config:
   features:
     # specify provider: proxmox if you are using capmox (cluster api provider for proxmox)
     provider: "default"
+    # Name of this Kubernetes cluster, used by ${k8sClusterName} in the diskName StorageClass parameter.
+    # Must be a DNS label (a-z, 0-9, '-'). Give every cluster sharing a Proxmox storage its own name.
+    # ref: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/disk-name.md
+    # k8sClusterName: "prod-k8s"
   clusters: []
   #   - url: https://cluster-api-1.exmple.com:8006/api2/json
   #     insecure: false
@@ -88,6 +92,16 @@ storageClass: []
   #
   #   mountOptions:
   #     - discard
+  #
+  # # Predictable disk names, so a recreated PVC gets its old disk back.
+  # # ref: https://github.com/sergelogvinov/proxmox-csi-plugin/blob/main/docs/disk-name.md
+  # - name: proxmox-zfs-named
+  #   storage: local-zfs
+  #   reclaimPolicy: Retain
+  #   extraParameters:
+  #     diskName: "${pvc.metadata.namespace}.${pvc.metadata.name}"
+  #     # diskName: "${k8sClusterName}.${pvc.metadata.namespace}.${pvc.metadata.name}"
+  #     # diskNameEnforceNamespace: "false"
   #
   #   # I am not recommending to use this option, but it is possible.
   #   # You should use region and zone topology keys together.

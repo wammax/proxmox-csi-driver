@@ -130,3 +130,37 @@ func TestCopyVolume(t *testing.T) {
 	assert.Equal(t, "storage:1000/vm-1000-disk-snap1.raw", copied.VolID())
 	assert.Equal(t, "region//storage/1000/vm-1000-disk-snap1.raw", copied.VolumeID())
 }
+
+func TestCopyVolumeFormats(t *testing.T) {
+	tests := []struct {
+		msg      string
+		volumeID string
+		expected string
+	}{
+		{msg: "Block storage", volumeID: "region/zone/local-lvm/vm-9999-pvc-123", expected: "vm-9999-snap1"},
+		{msg: "Block storage with dots", volumeID: "region/zone/local-zfs/vm-9999-myns.data", expected: "vm-9999-snap1"},
+		{msg: "Block storage ending in a format name", volumeID: "region/zone/local-zfs/vm-9999-myns.raw", expected: "vm-9999-snap1"},
+		{msg: "File based", volumeID: "region/zone/local/9999/vm-9999-pvc-123.qcow2", expected: "9999/vm-9999-snap1.qcow2"},
+		{msg: "File based with dots", volumeID: "region/zone/local/9999/vm-9999-myns.data.raw", expected: "9999/vm-9999-snap1.raw"},
+		{msg: "File based without format", volumeID: "region/zone/local/9999/vm-9999-disk", expected: "vm-9999-snap1"},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.msg, func(t *testing.T) {
+			v, err := volume.NewVolumeFromVolumeID(testCase.volumeID)
+			assert.Nil(t, err)
+
+			assert.Equal(t, testCase.expected, v.CopyVolume("vm-9999-snap1").Disk())
+		})
+	}
+}
+
+func TestVolumeTemplatedName(t *testing.T) {
+	v := volume.NewVolume("region", "zone", "local-zfs", "vm-9999-myns.data")
+	assert.Equal(t, "9999", v.VMID())
+	assert.Equal(t, "local-zfs:vm-9999-myns.data", v.VolID())
+
+	v = volume.NewVolume("region", "zone", "local", "vm-9999-myns.data", "qcow2")
+	assert.Equal(t, "9999", v.VMID())
+	assert.Equal(t, "9999/vm-9999-myns.data.qcow2", v.Disk())
+}
