@@ -1,7 +1,7 @@
 # Plan: templated disk names (`diskName`)
 
-Status: **planning done, ready to implement** — all open questions decided (incl. #6
-from the Context7 check).
+Status: **planning done, ready to implement** — all open questions decided, live
+verification and e2e baseline done.
 
 ## Goal
 
@@ -86,8 +86,11 @@ Notes:
 - **Length limit:** the whole name `vm-<vmid>-<suffix>` may be at most **120
   characters**.
   - Too long is an error, never cut short (cutting could also create identical names).
-  - Edge cases (device-mapper `-` doubling) are left to Proxmox/LVM, which return
-    clear errors.
+- **LVM device-mapper limit** (`lvm`/`lvmthin` only): `len(vg) + 1 + len(name) +
+  hyphens(vg) + hyphens(name)` must be at most 127 (device-mapper doubles every `-`).
+  The VG name comes from the storage config (`vgname`), which `CreateVolume` already
+  fetches. Too long gives `InvalidArgument`, for example `LVM device name would be 182
+  characters (hyphens count double), max 127`. Verified live, see open question 7.
 - **Volume ID limit:** in addition, the full volume ID (`region/zone/storage/disk`, the
   longer of the two ID forms) may be at most **128 bytes**, the CSI spec limit. Too long
   gives `InvalidArgument` with an error naming both lengths (disk name and volume ID).
@@ -109,7 +112,7 @@ or `_`. If the namespace is followed by `.` or `_`, and everything before it has
 known end, the namespace can always be found without ambiguity. Nothing a user
 controls can forge another namespace.
 
-**The parameter:** StorageClass parameter `diskNameEnforceNamespace`, default `"true"`.
+**The parameter:** StorageClass parameter `diskNameEnforceNamespace`, default `"true"` (a `*bool`, see [Unchanged behaviour without `diskName`](#unchanged-behaviour-without-diskname)).
 
 - **`"true"`: the template is checked; if it breaks a rule, `InvalidArgument`:**
   1. It must contain `${pvc.metadata.namespace}`, directly followed by `.` or `_`.
@@ -174,6 +177,35 @@ diskNameEnforceNamespace: "false"`.
   `diskName uses ${k8sClusterName} but features.k8sClusterName is not set in the driver
   config`.
 
+## Unchanged behaviour without `diskName`
+
+Without `diskName`, the driver must behave exactly as before: same Proxmox calls, same
+volume IDs, same PV attributes.
+
+- **Scoped to `diskName`:** template expansion, all name checks (characters, 120/128,
+  LVM), the PV check, the attach check, the all-nodes search, growing a reused disk,
+  **reporting the actual size of a larger disk**, the reuse log line, blocking
+  `replicate`, the PVC lookup for annotations.
+- **`diskNameEnforceNamespace` is a `*bool`** (json tag `diskNameEnforceNamespace`),
+  with the `true` default applied in code. `ToMap()` skips nil pointers, so the key
+  never appears in `volumeAttributes` unless it was set. A plain `bool` would add
+  `diskNameEnforceNamespace: "1"` to every new PV, because plain bools are always
+  written (that's why every PV today has `backup: "0"`, `iothread: "1"`). The
+  parameter is ignored when `diskName` isn't set.
+- **`diskName` itself** is a string with `omitempty`, so it only appears in
+  `volumeAttributes` when set. That's also how `ControllerPublishVolume` knows a
+  volume is a `diskName` volume.
+- **Global but without effect** (verified): `--extra-create-metadata` (keys ignored, not
+  copied into the PV), `features.k8sClusterName` (only checked when set).
+- **Two bug fixes stay global** (needed fixes #1 `isVolumeAttached` and #5
+  `CopyVolume`). For names the driver creates itself (`vm-9999-pvc-<uuid>`,
+  `9999/vm-9999-pvc-<uuid>.<fmt>`), they give exactly the same results as today: a UUID
+  can't be part of another one, and these names never contain a `.` except before
+  the format. The results only differ for manually imported static PVs with unusual
+  names, where the old behaviour was the bug.
+- **Proof:** see the "no `diskName`" tests under [Tests](#tests), plus the same e2e
+  scenarios compared with the baseline.
+
 ## Needed fixes in existing code
 
 1. **`isVolumeAttached` (`pkg/csi/utils.go:284`)** uses
@@ -193,7 +225,7 @@ diskNameEnforceNamespace: "false"`.
      `ControllerPublishVolume` grows the disk after attaching (`controller.go:603`)
      and `NodeStageVolume` grows the filesystem (`node.go:210`). Classic
      `pvc-<uuid>` volumes keep today's behaviour.
-   - **Larger than requested:** report the disk's **actual** size as
+   - **Larger than requested (only with `diskName`):** report the disk's **actual** size as
      `CapacityBytes`. If it exceeds the request's `limit_bytes`, return `OutOfRange`
      (CSI spec).
    - **Logging:** log clearly when an existing disk is reused, with old and new size.
@@ -339,7 +371,18 @@ via `Volume.PV()`.
 
 ## Tests
 
-- `pkg/csi/parameters_test.go`: parsing `diskName` and `diskNameEnforceNamespace`.
+- **No `diskName` (regression):**
+  - `CreateVolume` and `ControllerPublishVolume` without `diskName` produce exactly the
+    same Proxmox requests, volume ID and `volumeAttributes` as before;
+  - `ToMap()` without `diskName`/`diskNameEnforceNamespace` has no new keys;
+  - `diskNameEnforceNamespace` alone (without `diskName`) is ignored;
+  - `isVolumeAttached` and `CopyVolume` give the same results as before for
+    `vm-<id>-pvc-<uuid>` and `<id>/vm-<id>-pvc-<uuid>.<fmt>` names;
+  - the extra `csi.storage.k8s.io/*` parameters are ignored.
+- **LVM device-mapper check:** a name with many hyphens on `lvmthin` is rejected; the
+  same name on ZFS is accepted; the error states the computed length.
+- `pkg/csi/parameters_test.go`: parsing `diskName` and `diskNameEnforceNamespace`
+  (`*bool`: unset, `"true"`, `"false"`).
 - New unit tests for expanding templates: every variable, annotation keys with
   `.` and `/`, missing and empty values, invalid characters (rejected, not replaced),
   the 120-character limit, the 128-byte volume ID limit (long region/zone/storage
@@ -413,10 +456,26 @@ installed locally, so all building and testing happens there.
   1–2 Gi and delete them afterwards. The builder caps its Docker build cache at 3 GB.
 - **Baseline (commit 82ce560):** `make lint` 0 issues, `make unit` passes.
 - **Before implementing:**
-  1. Check the assumptions listed under "Not found in Context7" against the live
-     clusters (`--extra-create-metadata` keys, `volume.kubernetes.io/selected-node`).
-     The chart doesn't pass `--extra-create-metadata` today.
-  2. Run a baseline e2e pass. The e2e framework defaults to some StorageClass names
+  1. ~~Check the assumptions listed under "Not found in Context7" against the live
+     clusters.~~ Done, see
+     [Verification (live test env)](#verification-live-test-env-2026-09-26).
+  2. Run a baseline e2e pass. **Result on `91e8f1f` (unchanged driver code), k8s-a,
+     `E2E_STORAGECLASS=proxmox-lvm`:**
+
+     | Scenario | Result | Why |
+     |---|---|---|
+     | `capacity` | pass | |
+     | `attributes` | pass | Proxmox-side check skipped (`E2E_PROXMOX_CONFIG` not set) |
+     | `snapshot-zones` | skip | needs two zones |
+     | `lifecycle` | **fail (env)** | the test StatefulSet has *required* pod anti-affinity on `kubernetes.io/hostname`; the 2nd replica can't be scheduled on a single-node cluster |
+     | `snapshot` | **fail (env)** | 1st run: the chart's `csi-snapshotter` sidecar is off by default (`controller.snapshotter.enabled`), so nothing handled the snapshot. **Fixed:** enabled in `/root/dev/values-k8s-{a,b}.yaml` (backups `*.bak-snapshotter`) and on k8s-a via `helm upgrade --reuse-values`; the snapshotter then cleaned up the stuck leftovers. 2nd run: `403 Permission check failed (user != root@pam)`. Snapshots need a **root@pam** API token (`docs/volumesnapshot.md`), and the test env uses `kubernetes-csi@pve`. Cleaned up properly. |
+     | `ephemeral`, `shared`, `replication` | not run | need an encrypted SC, shared storage or two zones |
+
+     Both failures come from the environment, not the driver. To compare after
+     implementing: `lifecycle` can't pass on single-node clusters (or run only its
+     single-replica steps); `snapshot` needs a root@pam token (not set up, a security
+     decision). The snapshot-related parts of the plan (`CopyVolume` fix #5) are
+     therefore covered by unit tests only. The e2e framework defaults to some StorageClass names
      that don't exist here (`proxmox`, `proxmox-secret`, `proxmox-ceph`, `proxmox-rbd`;
      `proxmox-zfs` for replication does match); set
      `E2E_STORAGECLASS=proxmox-lvm`, `E2E_STORAGECLASSES=proxmox-lvm,proxmox-zfs,proxmox-dir`
@@ -492,15 +551,42 @@ section, not just a parameter list entry.
 - **gopkg.in/yaml.v3:** unknown keys are ignored unless `KnownFields(true)` is set; keys
   are matched against the `yaml:` tag.
 
-**Not found in Context7 (still from knowledge, verify in e2e or source):**
+**Not found in Context7 (still from knowledge):**
 - the CSI spec itself: `FailedPrecondition` for "published to another node",
   `OutOfRange` for `limit_bytes`, and the 128-byte size limit (see open question 6);
-- the external-provisioner's `--extra-create-metadata` flag and the exact keys
-  `csi.storage.k8s.io/pvc/name` and `csi.storage.k8s.io/pv/name`;
-- the `volume.kubernetes.io/selected-node` PVC annotation;
-- that StorageClass `parameters` can't be changed after creation (Context7 only
-  confirmed this for VolumeAttributesClass);
-- LVM, ZFS and RBD naming and length limits.
+- RBD naming and length limits (no Ceph in the test env).
+
+## Verification (live test env, 2026-09-26)
+
+Checked on k8s-a / the `dev` Proxmox host. The test objects were removed and the Helm
+release rolled back afterwards.
+
+- **`--extra-create-metadata`** exists in csi-provisioner v6.3.0 ("add pv/pvc metadata
+  to plugin create requests as parameters"). With it enabled, `CreateVolume` received:
+  `csi.storage.k8s.io/pv/name: pvc-<uuid>`, `csi.storage.k8s.io/pvc/name: data`,
+  `csi.storage.k8s.io/pvc/namespace: dn-verify`.
+  - These keys did **not** end up in the PV's `volumeAttributes` (only known fields
+    are copied), so turning the flag on changes nothing for existing volumes.
+  - **PVC annotations are not passed**, which confirms the extra PVC lookup for
+    `${pvc.metadata.annotations.*}`.
+- **`volume.kubernetes.io/selected-node: k8s-a`** is set on the PVC with
+  `WaitForFirstConsumer`, and stays there after binding.
+- **Request details seen:** `capacity_range` had only `required_bytes` (no
+  `limit_bytes`), so the `OutOfRange` case will rarely trigger with Kubernetes. A
+  `ReadWriteOnce` PVC arrives as access mode `SINGLE_NODE_MULTI_WRITER`.
+  `accessibility_requirements` had requisite and preferred both set to the selected
+  node's zone.
+- **StorageClass immutability:** a server-side dry-run patch of `parameters` and of
+  `reclaimPolicy` both failed with "field is immutable".
+- **Proxmox volume names** (`pvesm alloc`, 4 MiB, freed afterwards) on `local-lvm`
+  (LVM-thin), `local-zfs` (ZFS) and `local` (dir, raw): names with `.`, `_`,
+  uppercase, and a 120-character name were **all accepted** on all three.
+- **LVM device-mapper limit is real:** a 120-character name with 56 hyphens failed on
+  LVM-thin with "Failed to set device name" (nothing left behind). Device-mapper names
+  are `<vg>-<lv>` with every `-` doubled and must stay under 128 characters. With VG
+  `pve`, a 120-character name can contain only about 3 hyphens. Typical names are far
+  below this (`vm-9999-myns.data.prod-k8s`: 26 characters, 4 hyphens → 34). See open
+  question 7.
 
 ## Open questions
 
@@ -518,6 +604,18 @@ section, not just a parameter list entry.
 6. ~~Volume ID length.~~ Decided: keep the 120-character disk name limit **and** check
    that the full volume ID is at most 128 bytes (CSI spec, from knowledge; a
    third-party driver's docs also cite it). Today's IDs are about 75 bytes.
+7. **LVM device-mapper name length (new, from live verification).** On `lvm`/`lvmthin`
+   storages, `len(vg) + 1 + len(name) + hyphens(vg) + hyphens(name)` must stay under
+   128, otherwise Proxmox fails with "Failed to set device name" (tested). Options:
+   - **Check in the driver:** `CreateVolume` already fetches the storage config;
+     `vgname` is returned by the API (`local-lvm` → `pve`) and the client's `Storage`
+     struct has a `VGName` field. Give `InvalidArgument` with a clear message
+     ("LVM device name would be N characters (hyphens count double), max 127").
+   - **Leave it to Proxmox:** the error appears in the PVC events, but it's cryptic.
+
+   **Decided: check in the driver** (only for `diskName` volumes on `lvm`/`lvmthin`).
+8. ~~Does the driver behave exactly as before without `diskName`?~~ Decided, see
+   [Unchanged behaviour without `diskName`](#unchanged-behaviour-without-diskname).
 
 ## Later / out of scope
 
