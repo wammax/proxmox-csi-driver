@@ -1,4 +1,99 @@
-# Proxmox CSI Plugin
+# Proxmox CSI Plugin (fork)
+
+> **This is a fork of [sergelogvinov/proxmox-csi-plugin](https://github.com/sergelogvinov/proxmox-csi-plugin).**
+>
+> The Proxmox CSI Plugin was created by **[Serge Logvinov](https://github.com/sergelogvinov)** in 2023, and
+> nearly all of its code, design and documentation is his work. A big thank you to Serge for building
+> this plugin and sharing it as open source: it makes Proxmox a first-class storage backend for Kubernetes,
+> and this fork would not exist without it.
+>
+> This fork adds one feature on top of it: **predictable disk names** (`diskName`), described below.
+> Everything else is the original project. From [About the Proxmox CSI Plugin](#about-the-proxmox-csi-plugin)
+> on, this README is Serge's original text.
+
+## What this fork adds
+
+**Predictable disk names.** By default every PersistentVolume gets a Proxmox disk with a random name
+(`vm-9999-pvc-<uuid>`), so a PVC that is deleted and created again always gets a new, empty disk.
+With the new StorageClass parameter `diskName`, the disk name comes from a template instead,
+similar to `subDir` in [csi-driver-nfs](https://github.com/kubernetes-csi/csi-driver-nfs):
+
+```yaml
+parameters:
+  storage: local-zfs
+  diskName: "${pvc.metadata.namespace}.${pvc.metadata.name}"
+reclaimPolicy: Retain
+```
+
+A PVC `data` in namespace `myns` then always maps to the disk `local-zfs:vm-9999-myns.data`, and a
+recreated PVC gets its old disk and data back.
+
+* **Template variables:** PVC namespace and name, PV name, PVC annotations, the Proxmox region and zone,
+  and `${k8sClusterName}`: a new driver option (`features.k8sClusterName`) that keeps disks of several
+  Kubernetes clusters sharing one Proxmox storage apart.
+* **Namespaces stay apart:** by default the template is checked so that no PVC can produce the disk
+  name of another namespace (`diskNameEnforceNamespace`).
+* **Safety checks:** a disk is never handed out twice. A new PVC can't take a disk that another
+  active PV still uses, and a disk attached to another VM (for example one of another Kubernetes
+  cluster) is not attached a second time.
+* **Name checks:** allowed characters, length limits (including the LVM device-mapper limit), with clear
+  error messages that say how to fix the template.
+* **Unchanged without `diskName`:** StorageClasses without the parameter behave exactly as in the
+  original project.
+
+Full documentation: [Disk names](docs/disk-name.md). Example StorageClass:
+[proxmox-disk-name.yaml](docs/proxmox-disk-name.yaml).
+
+## Using this fork
+
+Images and Helm chart are published on the GitHub Container Registry:
+
+| | |
+|---|---|
+| Controller image | `ghcr.io/wammax/proxmox-csi-controller:v0.20.0-diskname.1` |
+| Node image | `ghcr.io/wammax/proxmox-csi-node:v0.20.0-diskname.1` |
+| CLI image | `ghcr.io/wammax/pvecsictl:v0.20.0-diskname.1` |
+| Helm chart | `oci://ghcr.io/wammax/charts/proxmox-csi-plugin`, version `0.6.0-diskname.1` |
+
+Versions are named after the original release they are based on, plus `-diskname.<n>`. The images
+are built for `linux/amd64` only.
+
+Install with Helm (the chart already points to the images above). Because of the `-diskname.1`
+suffix, Helm needs the version explicitly:
+
+```shell
+helm upgrade -i -n csi-proxmox --create-namespace proxmox-csi \
+  oci://ghcr.io/wammax/charts/proxmox-csi-plugin --version 0.6.0-diskname.1 \
+  -f values.yaml
+```
+
+Your `values.yaml` needs the same Proxmox configuration as the original chart
+(see [Installation](#installation) and [docs/install.md](docs/install.md)). To use `${k8sClusterName}`,
+give every Kubernetes cluster its own name:
+
+```yaml
+config:
+  features:
+    k8sClusterName: prod-k8s   # a DNS label, different in every cluster
+  clusters:
+    - url: https://cluster-api-1.example.com:8006/api2/json
+      token_id: "kubernetes-csi@pve!csi"
+      token_secret: "secret"
+      region: Region-1
+```
+
+The chart always starts `csi-provisioner` with `--extra-create-metadata`, which `diskName` needs.
+If you deploy without the chart, add that flag yourself.
+
+Then create a StorageClass with `diskName` (see [docs/disk-name.md](docs/disk-name.md) for the rules
+and pitfalls) and `reclaimPolicy: Retain`, so disks are kept when a PVC is deleted.
+
+**Issues:** problems with `diskName` belong in [this fork's issues](https://github.com/wammax/proxmox-csi-driver/issues).
+For everything else, please use the [original project](https://github.com/sergelogvinov/proxmox-csi-plugin/issues).
+
+## About the Proxmox CSI Plugin
+
+*The following is the original README of [sergelogvinov/proxmox-csi-plugin](https://github.com/sergelogvinov/proxmox-csi-plugin), by Serge Logvinov.*
 
 I have been using the `rancher.io/local-path` storage provisioner for over 3 years, and it has solved almost all of my problems.
 However, in the event that the server needs maintenance such as rebooting, upgrading, or reinstalling,
